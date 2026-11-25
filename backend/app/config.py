@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     page_timeout_ms: int = 45000
     max_html_chars: int = 18000
     groq_api_key: str = ""
-    groq_model: str = "llama-3.3-70b-versatile"
+    groq_model: str = "openai/gpt-oss-120b"
     auto_apply_threshold: float = 0.90
     review_threshold: float = 0.60
 

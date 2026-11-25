@@ -1,0 +1,26 @@
+data/
+*.db
+*.sqlite3
+__pycache__/
+.venv/
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Tests
+test/
+tests/
+__tests__/
+test_*.py
+*_test.py
+*.test.js
+*.test.jsx
+*.test.ts
+*.test.tsx
+*.spec.js
+*.spec.jsx
+*.spec.ts
+*.spec.tsx
+.pytest_cache/
+
+

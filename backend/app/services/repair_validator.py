@@ -6,6 +6,7 @@ from app.services.extractor import (
     ALLOWED_TRANSFORMS,
     extract_records,
 )
+from app.services.validation_service import validate_records
 
 
 def validate_repair(
@@ -104,25 +105,12 @@ def validate_repair(
     if not records:
         raise ValueError("Repaired configuration extracted no records")
 
-    required_fields = [
-        name
-        for name, definition in candidate["fields"].items()
-        if definition.get("required", False)
-    ]
+    val = validate_records(records, candidate)
+    validation_confidence = val["confidence"]
+    diagnostics["validation"] = val
 
-    total = len(records) * len(required_fields)
-
-    filled = sum(
-        1
-        for record in records
-        for name in required_fields
-        if record.get(name) is not None
-        and str(record.get(name)).strip() != ""
-    )
-
-    validation_confidence = filled / total if total else 1.0
-
-    if validation_confidence < 0.60:
+    if validation_confidence < 0.60 or not val["is_valid"]:
+        error_msg = "; ".join(val.get("validation_errors", []))
         return {
             "config": candidate,
             "records": records,
@@ -130,8 +118,16 @@ def validate_repair(
             "confidence": round(validation_confidence, 3),
             "ai_confidence": round(float(confidence), 3),
             "reason": (
-                "Rejected: repaired configuration has low "
-                "extraction confidence. "
-                + str(repair.get("reason", ""))[:400]
+                "Rejected: repaired configuration failed validation. "
+                + (error_msg or str(repair.get("reason", "")))[:400]
             ),
         }
+
+    return {
+        "config": candidate,
+        "records": records,
+        "diagnostics": diagnostics,
+        "confidence": round(validation_confidence, 3),
+        "ai_confidence": round(float(confidence), 3),
+        "reason": str(repair.get("reason", ""))[:400],
+    }

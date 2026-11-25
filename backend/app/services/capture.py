@@ -7,6 +7,7 @@ import time
 import uuid
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from ..config import settings
+from .async_helper import run_with_subprocess_loop
 
 @dataclass
 class CaptureResult:
@@ -37,7 +38,7 @@ def validate_public_http_url(url: str) -> None:
     if not addresses or any(not addr.is_global for addr in addresses):
         raise ValueError("The website resolves to a private or reserved IP address and cannot be captured.")
 
-async def capture_page(url: str, snapshot_dir: str | None = None) -> CaptureResult:
+async def _capture_page_impl(url: str, snapshot_dir: str | None = None) -> CaptureResult:
     validate_public_http_url(url)
     started = time.perf_counter()
     async with async_playwright() as p:
@@ -74,5 +75,14 @@ async def capture_page(url: str, snapshot_dir: str | None = None) -> CaptureResu
                 int((time.perf_counter()-started)*1000), title,
                 response.status if response else None)
         finally:
-            await context.close()
-            await browser.close()
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+async def capture_page(url: str, snapshot_dir: str | None = None) -> CaptureResult:
+    return await run_with_subprocess_loop(_capture_page_impl, url, snapshot_dir)

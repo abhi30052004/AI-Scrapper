@@ -5,18 +5,14 @@ import sqlite3
 from pathlib import Path
 from urllib.parse import urlparse
 
+from app.config import settings
 from app.services.ai_client import generate_config
-from app.services.extractor import extract_records
-
-
-ALLOWED_TRANSFORMS = {
-    "strip", "strip_currency", "to_number",
-    "to_date", "lowercase", "absolute_url",
-}
+from app.services.extractor import extract_records, ALLOWED_TRANSFORMS
+from app.services.validation_service import validate_records
 
 
 def get_database_path():
-    database_url = os.getenv(
+    database_url = getattr(settings, "database_url", None) or os.getenv(
         "DATABASE_URL", "sqlite:///./data/scraper.db"
     )
 
@@ -26,10 +22,19 @@ def get_database_path():
         )
 
     path = database_url.replace("sqlite:///", "", 1)
-    db_path = Path(path)
+    # Strip any leading ./ or .\
+    clean_path = path.lstrip("./").lstrip(".\\")
+    backend_dir = Path(__file__).resolve().parents[2]
 
-    if not db_path.is_absolute():
-        db_path = Path.cwd() / db_path
+    # If already absolute
+    if Path(path).is_absolute():
+        db_path = Path(path)
+    elif (backend_dir / clean_path).exists():
+        db_path = backend_dir / clean_path
+    elif (Path.cwd() / clean_path).exists():
+        db_path = Path.cwd() / clean_path
+    else:
+        db_path = backend_dir / clean_path
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return db_path
@@ -37,7 +42,19 @@ def get_database_path():
 
 def initialize_onboarding_db():
     with sqlite3.connect(get_database_path()) as conn:
-                conn.execute("""
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS scraper_configs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                site_url TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                config_json TEXT NOT NULL,
+                sample_records TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                status TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS repair_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 original_config_id INTEGER NOT NULL,
@@ -63,7 +80,8 @@ def validate_config(config, fields, url):
     if config.get("version") != 1:
         raise ValueError("Unsupported config version")
 
-    if config.get("start_url") != url:
+    # Accept URLs that differ only by trailing slash
+    if config.get("start_url", "").rstrip("/") != url.rstrip("/"):
         raise ValueError("Config URL does not match requested URL")
 
     item_selector = config.get("item_selector")
@@ -73,7 +91,26 @@ def validate_config(config, fields, url):
     if not isinstance(config.get("fields"), dict):
         raise ValueError("Config fields must be an object")
 
+    # Normalize fields if selectors is provided as a string
+    for name, definition in config["fields"].items():
+        if isinstance(definition, dict):
+            if isinstance(definition.get("selectors"), str):
+                definition["selectors"] = [definition["selectors"]]
+
     requested_names = {field["name"] for field in fields}
+    
+    # If any optional requested field was omitted by the AI, supply an empty definition
+    for f in fields:
+        fname = f["name"]
+        if fname not in config["fields"] and not f.get("required", False):
+            config["fields"][fname] = {
+                "selectors": [],
+                "attr": "text",
+                "type": f.get("type", "string"),
+                "required": False,
+                "transform": "strip",
+            }
+            
     generated_names = set(config["fields"])
 
     if requested_names != generated_names:
@@ -129,35 +166,20 @@ def run_onboarding(url, fields, html):
 
     records, diagnostics = extract_records(html, config, url)
 
-    required_fields = [
-        field["name"] for field in fields
-        if field.get("required", True)
-    ]
-
-    if not records:
-        raise ValueError(
-            "No records were extracted. Review the generated selectors."
-        )
-
-    total = len(records) * len(required_fields)
-    filled = sum(
-        1
-        for record in records
-        for name in required_fields
-        if record.get(name) is not None
-    )
-
-    confidence = filled / total if total else 1.0
+    validation = validate_records(records, config)
+    confidence = validation["confidence"]
+    status = "ready_for_review" if validation["is_valid"] and confidence >= 0.80 else "needs_review"
+    diagnostics["validation"] = validation
 
     return {
         "config": config,
         "records": records,
         "diagnostics": diagnostics,
         "confidence": round(confidence, 3),
-        "status": (
-            "ready_for_review" if confidence >= 0.60
-            else "needs_review"
-        ),
+        "status": status,
+        "validation": validation,
+        "failed_fields": validation.get("failed_fields", []),
+        "explanation": "; ".join(validation.get("validation_errors", [])) if not validation["is_valid"] else "Configuration passed sample record validation.",
     }
 
 

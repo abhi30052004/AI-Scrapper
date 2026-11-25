@@ -126,9 +126,11 @@ def export_extraction_run(
         writer.writeheader()
         writer.writerows(records)
 
+    csv_content = "\ufeff" + output.getvalue()
+
     return Response(
-        content=output.getvalue(),
-        media_type="text/csv",
+        content=csv_content,
+        media_type="text/csv; charset=utf-8",
         headers={
             "Content-Disposition":
                 f'attachment; filename="extraction_{run_id}.csv"'

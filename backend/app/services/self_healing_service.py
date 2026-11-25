@@ -14,13 +14,14 @@ from app.services.onboarding import (
     save_repair_history,
 )
 from app.services.repair_validator import validate_repair
+from app.services.async_helper import run_with_subprocess_loop
 
 
 AUTO_APPLY_THRESHOLD = 0.90
 HUMAN_REVIEW_THRESHOLD = 0.60
 
 
-async def capture_latest_html(url: str) -> tuple[str, str]:
+async def _capture_latest_html_impl(url: str) -> tuple[str, str]:
     """Safely capture the latest rendered website HTML."""
 
     validate_public_http_url(url)
@@ -73,8 +74,18 @@ async def capture_latest_html(url: str) -> tuple[str, str]:
             return html, page.url
 
         finally:
-            await context.close()
-            await browser.close()
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+
+async def capture_latest_html(url: str) -> tuple[str, str]:
+    return await run_with_subprocess_loop(_capture_latest_html_impl, url)
 
 
 def build_failure_report(
