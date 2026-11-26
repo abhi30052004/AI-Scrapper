@@ -28,6 +28,8 @@ async def extract(payload: ExtractionRequest):
         return await run_extraction(
             config_id=payload.config_id,
             max_pages_override=payload.max_pages,
+            extract_details_override=payload.extract_details,
+            max_detail_pages_override=payload.max_detail_pages,
         )
 
     except ValueError as exc:

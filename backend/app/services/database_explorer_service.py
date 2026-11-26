@@ -100,21 +100,10 @@ def sync_run_products(
         return value or None
 
     def canonicalize(value):
-        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+        from app.services.extractor import canonicalize_product_url
         if not value:
             return None
-        absolute = value.strip()
-        parts = urlsplit(absolute)
-        if not parts.scheme or not parts.netloc:
-            return absolute.rstrip("/")
-        # Remove fragments and common tracking parameters while preserving
-        # meaningful query parameters (e.g. product variant identifiers).
-        tracking = {"utm_source", "utm_medium", "utm_campaign", "utm_term",
-                    "utm_content", "gclid", "fbclid", "ref"}
-        query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
-                 if k.lower() not in tracking]
-        return urlunsplit((parts.scheme.lower(), parts.netloc.lower(),
-                           parts.path.rstrip("/") or "/", urlencode(query), ""))
+        return canonicalize_product_url(str(value).strip(), start_url) or None
 
     with sqlite3.connect(db_path, timeout=30) as conn:
         conn.row_factory = sqlite3.Row
@@ -128,22 +117,15 @@ def sync_run_products(
         site_id = site_row["id"] if site_row else None
         site_name = site_row["name"] if site_row else start_url
 
-        # Remove legacy duplicates before creating the partial unique index.
-        # Keep the newest row so historical data is not arbitrarily discarded.
-        conn.execute("""
-            DELETE FROM products
-            WHERE product_url IS NOT NULL
-              AND id NOT IN (
-                SELECT MAX(id) FROM products
-                WHERE product_url IS NOT NULL
-                GROUP BY COALESCE(site_id, -1), RTRIM(product_url, '/')
-              )
-        """)
-        conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_products_site_url
-            ON products(COALESCE(site_id, -1), RTRIM(product_url, '/'))
-            WHERE product_url IS NOT NULL AND TRIM(product_url) <> ''
-        """)
+        # Ensure unique index exists without ever deleting existing product records
+        try:
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_products_site_url
+                ON products(COALESCE(site_id, -1), RTRIM(product_url, '/'))
+                WHERE product_url IS NOT NULL AND TRIM(product_url) <> ''
+            """)
+        except sqlite3.IntegrityError:
+            pass
 
         saved = 0
         updated = 0
@@ -153,17 +135,46 @@ def sync_run_products(
         seen_without_url = set()
         seen_canonical_in_batch = set()
 
+        def _non_empty_merge(prev: dict, inc: dict) -> dict:
+            merged = dict(prev)
+            for k, v in inc.items():
+                if v in (None, "", [], {}):
+                    continue
+                existing_val = merged.get(k)
+                if k == "specifications" and isinstance(v, dict):
+                    prev_s = existing_val if isinstance(existing_val, dict) else {}
+                    merged["specifications"] = {**prev_s, **v}
+                elif k == "image_urls" and isinstance(v, list):
+                    prev_i = existing_val if isinstance(existing_val, list) else []
+                    merged["image_urls"] = list(dict.fromkeys(prev_i + v))
+                else:
+                    merged[k] = v
+            return merged
+
+        from app.services.validation_service import is_genuine_product
+
         for rec in records:
             if not isinstance(rec, dict):
                 failed += 1
                 continue
             try:
+                is_prod, _ = is_genuine_product(rec)
+                if not is_prod:
+                    skipped += 1
+                    continue
+
                 title = clean_text(rec.get("title") or rec.get("name") or rec.get("product_name"))
                 price = clean_text(rec.get("price"))
                 rating = clean_text(rec.get("rating"))
                 availability = clean_text(rec.get("availability"))
                 product_url = clean_text(rec.get("product_url") or rec.get("url"))
                 canonical_url = canonicalize(product_url)
+
+                # Reject completely empty or invalid-only records
+                if not title and not canonical_url:
+                    failed += 1
+                    continue
+
                 raw_json = json.dumps(rec, ensure_ascii=False, default=str)
 
                 if not canonical_url:
@@ -202,21 +213,47 @@ def sync_run_products(
                             previous_raw = {}
                     except (TypeError, ValueError):
                         previous_raw = {}
-                    merged_raw = {**previous_raw, **{k: v for k, v in rec.items() if v not in (None, "")}}
-                    conn.execute("""
-                        UPDATE products
-                        SET run_id = ?, config_id = ?, site_name = ?,
-                            title = COALESCE(NULLIF(?, ''), title),
-                            price = COALESCE(NULLIF(?, ''), price),
-                            rating = COALESCE(NULLIF(?, ''), rating),
-                            availability = COALESCE(NULLIF(?, ''), availability),
-                            product_url = ?, scraped_at = ?, raw_data_json = ?
-                        WHERE id = ?
-                    """, (run_id, config_id, site_name, title, price, rating,
-                          availability, canonical_url, created_at,
-                          json.dumps(merged_raw, ensure_ascii=False, default=str),
-                          existing["id"]))
-                    updated += 1
+
+                    merged_raw = _non_empty_merge(previous_raw, rec)
+                    new_title = title or existing["title"]
+                    new_price = price or existing["price"]
+                    new_rating = rating or existing["rating"]
+                    new_avail = availability or existing["availability"]
+
+                    transient_keys = {"extraction_source", "card_index", "raw_html_audit"}
+                    prev_comparable = {k: v for k, v in previous_raw.items() if k not in transient_keys}
+                    merged_comparable = {k: v for k, v in merged_raw.items() if k not in transient_keys}
+
+                    data_changed = (
+                        new_title != existing["title"]
+                        or new_price != existing["price"]
+                        or new_rating != existing["rating"]
+                        or new_avail != existing["availability"]
+                        or merged_comparable != prev_comparable
+                    )
+
+                    if data_changed:
+                        conn.execute("""
+                            UPDATE products
+                            SET run_id = ?, config_id = ?, site_name = ?,
+                                title = ?, price = ?, rating = ?, availability = ?,
+                                product_url = ?, scraped_at = ?, raw_data_json = ?
+                            WHERE id = ?
+                        """, (
+                            run_id, config_id, site_name,
+                            new_title, new_price, new_rating, new_avail,
+                            canonical_url, created_at,
+                            json.dumps(merged_raw, ensure_ascii=False, default=str),
+                            existing["id"],
+                        ))
+                        updated += 1
+                    else:
+                        conn.execute("""
+                            UPDATE products
+                            SET run_id = ?, scraped_at = ?
+                            WHERE id = ?
+                        """, (run_id, created_at, existing["id"]))
+                        skipped += 1
                 else:
                     conn.execute("""
                         INSERT INTO products (

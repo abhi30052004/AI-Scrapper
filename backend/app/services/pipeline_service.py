@@ -4,7 +4,6 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 from sqlalchemy.orm import Session
 
@@ -12,17 +11,18 @@ from app.config import settings
 from app.models import CaptureRun, Site
 from app.services.capture import capture_page
 from app.services.cleaner import clean_html
-from app.services.extractor import extract_records
-from app.services.onboarding import (
-    get_database_path,
-    initialize_onboarding_db,
-    run_onboarding,
-    save_config,
-)
-from app.services.extraction_service import initialize_extraction_db
 from app.services.database_explorer_service import (
     initialize_database_explorer_db,
     sync_run_products,
+)
+from app.services.extraction_service import (
+    ensure_semantic_config,
+    initialize_extraction_db,
+)
+from app.services.extractor import extract_semantic_products
+from app.services.onboarding import (
+    get_database_path,
+    initialize_onboarding_db,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,60 +50,11 @@ def serialize_capture_record(item: CaptureRun) -> dict[str, Any]:
     }
 
 
-def find_compatible_config(url: str, html: str) -> tuple[dict[str, Any] | None, int | None]:
-    """
-    Search existing configurations in scraper_configs that belong to this website
-    and test whether they successfully extract records from the captured HTML.
-    Never reuses an incompatible configuration (e.g. Books to Scrape on Amazon).
-    """
-    initialize_onboarding_db()
-    parsed_target = urlparse(url)
-    target_netloc = parsed_target.netloc.lower()
-
-    with sqlite3.connect(get_database_path()) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute("""
-            SELECT id, site_url, version, config_json, status
-            FROM scraper_configs
-            ORDER BY id DESC
-        """).fetchall()
-
-    for row in rows:
-        row_url = row["site_url"]
-        row_netloc = urlparse(row_url).netloc.lower()
-
-        # Only reuse configs for the same domain
-        if row_netloc and target_netloc and (
-            row_netloc == target_netloc
-            or row_netloc.endswith(f".{target_netloc}")
-            or target_netloc.endswith(f".{row_netloc}")
-        ):
-            try:
-                cfg = json.loads(row["config_json"])
-                if isinstance(cfg, dict) and cfg.get("item_selector"):
-                    records, _ = extract_records(html, cfg, url)
-                    if records and len(records) > 0:
-                        logger.info(
-                            f"Reusing compatible configuration #{row['id']} "
-                            f"(extracted {len(records)} items)"
-                        )
-                        return cfg, row["id"]
-            except Exception as e:
-                logger.debug(f"Config #{row['id']} not compatible: {e}")
-
-    return None, None
-
-
 def _persist_capture_run_sqlite(capture_result, cleaned: str, site_id: int | None) -> int:
-    """
-    Fallback: insert capture_run directly via sqlite3 when SQLAlchemy session is unavailable,
-    or when we need to ensure the row exists before reading its id.
-    Returns the new row id.
-    """
+    """Fallback insert into capture_runs when SQLAlchemy session is unavailable."""
     initialize_onboarding_db()
     db_path = get_database_path()
 
-    # Ensure capture_runs table exists (created by SQLAlchemy Base.metadata.create_all)
     with sqlite3.connect(db_path) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS capture_runs (
@@ -150,15 +101,16 @@ def _save_extraction_run_sqlite(
     records: list,
     diagnostics: dict,
     capture_run_id: int | None,
-) -> int:
-    """Insert into extraction_runs and return the new run id."""
+) -> tuple[int, str]:
+    """Insert into extraction_runs and return (new_run_id, created_at_iso)."""
     db_path = get_database_path()
     now_iso = datetime.now(timezone.utc).isoformat()
     diag_copy = dict(diagnostics)
     if capture_run_id is not None:
         diag_copy["capture_id"] = capture_run_id
 
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path, timeout=30) as conn:
+        conn.execute("PRAGMA busy_timeout = 30000")
         cur = conn.execute("""
             INSERT INTO extraction_runs (
                 config_id, start_url, pages_crawled,
@@ -169,8 +121,8 @@ def _save_extraction_run_sqlite(
             url,
             1,
             len(records),
-            json.dumps(records, ensure_ascii=False),
-            json.dumps(diag_copy, ensure_ascii=False),
+            json.dumps(records, ensure_ascii=False, default=str),
+            json.dumps(diag_copy, ensure_ascii=False, default=str),
             now_iso,
         ))
         return cur.lastrowid, now_iso
@@ -182,14 +134,13 @@ async def execute_capture_and_extract_pipeline(
     db: Session | None = None,
 ) -> dict[str, Any]:
     """
-    Automated workflow:
-    1. Capture webpage with Playwright (SSRF validated).
-    2. Save screenshot and raw HTML to disk.
-    3. Save capture record to SQLite (via SQLAlchemy if db provided, else raw sqlite3).
-    4. Find compatible configuration or generate one via AI onboarding.
-    5. Extract records directly from captured HTML.
-    6. Save extraction run and products to SQLite.
-    7. Return unified capture+extraction data with explicit error messages on failure.
+    Semantic HTML + LLM Structured Extraction pipeline:
+    1. Capture rendered webpage with Playwright (SSRF validated).
+    2. Save screenshot and raw HTML to disk for auditing.
+    3. Save capture record to SQLite.
+    4. Ensure a semantic_llm configuration exists for this URL.
+    5. Run Semantic Content Extraction -> Batched Groq JSON -> Validation.
+    6. Save extraction run and upsert products safely into SQLite.
     """
     initialize_onboarding_db()
     initialize_extraction_db()
@@ -199,24 +150,19 @@ async def execute_capture_and_extract_pipeline(
     if db is not None and site_id is not None:
         site = db.get(Site, site_id)
 
-    # ── Step 1: Capture webpage ───────────────────────────────────────────────
     capture_result = await capture_page(url, "data/snapshots")
 
-    # ── Step 2: Save raw HTML to disk alongside screenshot ───────────────────
     if capture_result.screenshot_path:
         try:
             folder = Path(capture_result.screenshot_path).parent
             raw_html_path = folder / "raw.html"
             raw_html_path.write_text(capture_result.html, encoding="utf-8", errors="replace")
         except Exception as e:
-            logger.warning(f"Could not save raw.html: {e}")
+            logger.warning("Could not save raw.html: %s", e)
 
-    # ── Step 3: Clean HTML ────────────────────────────────────────────────────
     cleaned = clean_html(capture_result.html, max_chars=settings.max_html_chars)
 
-    # ── Step 4: Persist CaptureRun ───────────────────────────────────────────
     capture_run_id: int | None = None
-
     if db is not None:
         capture_record = CaptureRun(
             site_id=site.id if site else None,
@@ -258,103 +204,68 @@ async def execute_capture_and_extract_pipeline(
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
-    logger.info(
-        f"Capture saved: id={capture_run_id} url={capture_result.final_url} "
-        f"status={capture_result.status_code} html={len(capture_result.html)} chars"
+    fields = (
+        [{"name": f.name, "type": f.data_type, "required": bool(f.required)} for f in site.fields]
+        if (site and site.fields)
+        else None
     )
+    config_id = ensure_semantic_config(capture_result.final_url, fields=fields)
 
-    # ── Step 5: Find or generate extraction configuration ────────────────────
-    matched_config, config_id = find_compatible_config(capture_result.final_url, capture_result.html)
-    ai_error: str | None = None
-
-    if not matched_config:
-        # Build field list from site definition or use sensible defaults
-        if site and site.fields:
-            fields = [
-                {"name": f.name, "type": f.data_type, "required": bool(f.required)}
-                for f in site.fields
-            ]
-        else:
-            fields = [
-                {"name": "title",        "type": "string", "required": True},
-                {"name": "price",        "type": "string", "required": True},
-                {"name": "rating",       "type": "string", "required": False},
-                {"name": "availability", "type": "string", "required": False},
-                {"name": "product_url",  "type": "string", "required": False},
-            ]
-
-        try:
-            onboard_res = run_onboarding(
-                url=capture_result.final_url,
-                fields=fields,
-                html=capture_result.html,
-            )
-            saved = save_config(capture_result.final_url, onboard_res)
-            matched_config = onboard_res["config"]
-            config_id = saved["id"]
-            logger.info(
-                f"AI generated new config #{config_id} for {capture_result.final_url} "
-                f"with {len(onboard_res['records'])} sample records"
-            )
-        except Exception as exc:
-            ai_error = str(exc)
-            logger.warning(
-                f"Could not automatically generate configuration for {url}: {exc}"
-            )
-            output["extraction"] = {
-                "status": "needs_configuration",
-                "run_id": None,
-                "config_id": None,
-                "record_count": 0,
-                "records": [],
-                "message": (
-                    "Webpage captured and saved successfully. "
-                    "Automatic AI configuration generation failed — "
-                    "please check your GROQ_API_KEY and network connectivity, "
-                    "then retry or manually configure field selectors."
-                ),
-                "error": ai_error[:500] if ai_error else None,
-            }
-            return output
-
-    # ── Step 6: Extract records from captured HTML ───────────────────────────
     try:
-        records, diagnostics = extract_records(
+        records, sem_diag = extract_semantic_products(
             capture_result.html,
-            matched_config,
             capture_result.final_url,
+            config={"fields": {f["name"]: f for f in (fields or [])}} if fields else None,
         )
 
-        logger.info(
-            f"Extracted {len(records)} records from {capture_result.final_url} "
-            f"using config #{config_id}"
-        )
+        validation = sem_diag.get("validation", {})
+        diagnostics = {
+            "extraction_mode": "semantic_llm",
+            "pages_visited": 1,
+            "pages_crawled": 1,
+            "product_cards_detected": sem_diag.get("product_cards_detected", 0),
+            "llm_batches_processed": sem_diag.get("llm_batches_processed", 0),
+            "llm_cache_hits": sem_diag.get("llm_cache_hits", 0),
+            "products_extracted": len(records),
+            "products_validated": validation.get("valid_records", 0),
+            "rejected_non_product_count": sem_diag.get("rejected_non_product_count", 0),
+            "rejected_non_products": sem_diag.get("rejected_non_products", []),
+            "products_inserted": 0,
+            "products_updated": 0,
+            "duplicates_skipped": 0,
+            "failed_records": validation.get("invalid_records", 0),
+            "error_messages": sem_diag.get("llm_errors", []),
+            "json_ld_count": sem_diag.get("json_ld_count", 0),
+            "page_metadata": sem_diag.get("page_metadata", {}),
+            "validation": validation,
+        }
 
-        # ── Step 7: Persist extraction_run ───────────────────────────────────
         run_id, now_iso = _save_extraction_run_sqlite(
             config_id=config_id,
-            url=url,
+            url=capture_result.final_url,
             records=records,
             diagnostics=diagnostics,
             capture_run_id=capture_run_id,
         )
-        logger.info(f"Saved extraction_run id={run_id}")
 
-        # ── Step 8: Sync products table ──────────────────────────────────────
-        products_saved = 0
-        if records:
-            products_saved = sync_run_products(
-                run_id=run_id,
-                config_id=config_id,
-                start_url=url,
-                records=records,
-                created_at=now_iso,
-            )
-            logger.info(f"Saved {products_saved} products from run #{run_id}")
-        else:
-            logger.warning(
-                f"Config #{config_id} extracted 0 records from {capture_result.final_url}. "
-                "Selectors may need updating."
+        sync_stats = sync_run_products(
+            run_id=run_id,
+            config_id=config_id,
+            start_url=capture_result.final_url,
+            records=records,
+            created_at=now_iso,
+        )
+
+        diagnostics["products_inserted"] = sync_stats.saved
+        diagnostics["products_updated"] = sync_stats.updated
+        diagnostics["duplicates_skipped"] = sync_stats.skipped
+        diagnostics["failed_records"] = sync_stats.failed + validation.get("invalid_records", 0)
+
+        with sqlite3.connect(get_database_path(), timeout=30) as conn:
+            conn.execute("PRAGMA busy_timeout = 30000")
+            conn.execute(
+                "UPDATE extraction_runs SET diagnostics_json = ? WHERE id = ?",
+                (json.dumps(diagnostics, ensure_ascii=False, default=str), run_id),
             )
 
         if site and db is not None:
@@ -366,22 +277,26 @@ async def execute_capture_and_extract_pipeline(
             "run_id": run_id,
             "config_id": config_id,
             "record_count": len(records),
-            "products_saved": products_saved,
+            "products_saved": sync_stats.saved,
+            "products_inserted": sync_stats.saved,
+            "products_updated": sync_stats.updated,
+            "duplicates_skipped": sync_stats.skipped,
+            "failed_records": sync_stats.failed,
+            "product_cards_detected": diagnostics["product_cards_detected"],
+            "llm_batches_processed": diagnostics["llm_batches_processed"],
+            "products_validated": diagnostics["products_validated"],
+            "rejected_non_product_count": diagnostics["rejected_non_product_count"],
             "records": records[:5],
             "message": (
-                f"Successfully extracted and saved {len(records)} products from captured HTML."
+                f"Successfully extracted {len(records)} products via semantic LLM pipeline "
+                f"({sync_stats.saved} inserted, {sync_stats.updated} updated, {sync_stats.skipped} skipped)."
                 if records
-                else (
-                    "Capture and configuration succeeded, but 0 products matched the selectors. "
-                    "The page structure may differ from what the AI expected. "
-                    "Try reconfiguring the selectors."
-                )
+                else "Webpage captured, but no product cards were detected on the page."
             ),
-            "error": None,
+            "error": "; ".join(diagnostics["error_messages"]) if diagnostics["error_messages"] else None,
         }
-
     except Exception as exc:
-        logger.error(f"Extraction failed on captured HTML: {exc}", exc_info=True)
+        logger.error("Semantic extraction failed on captured HTML: %s", exc, exc_info=True)
         output["extraction"] = {
             "status": "failed",
             "run_id": None,
@@ -389,7 +304,7 @@ async def execute_capture_and_extract_pipeline(
             "record_count": 0,
             "products_saved": 0,
             "records": [],
-            "message": "Webpage captured successfully but extraction failed.",
+            "message": "Webpage captured successfully but semantic extraction failed.",
             "error": str(exc)[:500],
         }
 

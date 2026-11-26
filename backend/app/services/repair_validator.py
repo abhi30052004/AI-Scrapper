@@ -101,7 +101,6 @@ def validate_repair(
         candidate,
         base_url,
     )
-
     if not records:
         raise ValueError("Repaired configuration extracted no records")
 

@@ -1,7 +1,20 @@
 import json
 import re
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from bs4 import BeautifulSoup
+
+from app.services.llm_extractor import (
+    extract_details_with_llm,
+    extract_products_with_llm,
+)
+from app.services.semantic_extractor import (
+    extract_semantic_detail,
+    extract_semantic_listing,
+)
+from app.services.validation_service import (
+    merge_product_records,
+    validate_and_normalize_records,
+)
 
 ALLOWED_TRANSFORMS = {
     "strip",
@@ -43,18 +56,29 @@ def is_storage_value(value: str) -> bool:
 
 
 def canonicalize_product_url(url: str, base_url: str = "") -> str:
-    """Normalize a product URL for deduplication and matching."""
+    """Normalize a product URL for deduplication and matching while preserving variant params."""
     if not url:
         return ""
     if base_url:
         url = urljoin(base_url, str(url).strip())
     parts = urlsplit(url)
+    if not parts.scheme or not parts.netloc:
+        return str(url).strip().rstrip("/")
+    tracking = {
+        "utm_source", "utm_medium", "utm_campaign", "utm_term",
+        "utm_content", "gclid", "fbclid", "ref",
+    }
+    query = [
+        (k, v)
+        for k, v in parse_qsl(parts.query, keep_blank_values=True)
+        if k.lower() not in tracking
+    ]
     return urlunsplit((
         parts.scheme.lower(),
         parts.netloc.lower(),
         parts.path.rstrip("/") or "/",
+        urlencode(query),
         "",
-        ""
     ))
 
 
@@ -375,3 +399,125 @@ def extract_records(html: str, config: dict, base_url: str):
 
     diagnostics["merged_count"] = len(records)
     return records, diagnostics
+
+
+def filter_listing_cards(cards: list[dict]) -> list[dict]:
+    """Filter out obvious sponsored/promoted ad banners that lack a genuine product page."""
+    filtered = []
+    for card in cards:
+        if card.get("is_promoted") and not card.get("matched_json_ld"):
+            continue
+        filtered.append(card)
+    return filtered
+
+
+def extract_semantic_products_from_cards(
+    cards: list[dict],
+    base_url: str,
+    config: dict | None = None,
+) -> tuple[list[dict], dict]:
+    """Run LLM structured extraction and validation on pre-extracted semantic cards."""
+    llm_res = extract_products_with_llm(cards, base_url)
+    normalized, validation = validate_and_normalize_records(
+        llm_res["records"],
+        base_url=base_url,
+        config=config,
+        filter_non_products=True,
+    )
+    rejected = list(llm_res.get("rejected_non_products", [])) + list(validation.get("rejected_non_products", []))
+    metrics = {
+        "cards_processed": len(cards),
+        "llm_batches_processed": llm_res["llm_batches_processed"],
+        "llm_cache_hits": llm_res["cache_hits"],
+        "llm_errors": llm_res["errors"],
+        "rejected_non_products": rejected,
+        "validation": validation,
+    }
+    return normalized, metrics
+
+
+def extract_semantic_products(
+    html: str,
+    base_url: str,
+    config: dict | None = None,
+) -> tuple[list[dict], dict]:
+    """
+    Full single-page semantic pipeline:
+    HTML -> Semantic Content Extraction -> LLM Structured JSON -> Validation.
+    """
+    semantic = extract_semantic_listing(html, base_url)
+    cards = filter_listing_cards(semantic["cards"])
+
+    records, card_metrics = extract_semantic_products_from_cards(cards, base_url, config=config)
+
+    # Include any JSON-LD products not represented in DOM cards
+    existing_urls = {
+        canonicalize_product_url(str(r.get("product_url") or ""), base_url)
+        for r in records
+        if r.get("product_url")
+    }
+    extra_ld_records = []
+    for ld in semantic["json_ld"]["products"]:
+        ld_url = canonicalize_product_url(str(ld.get("product_url") or ""), base_url)
+        if ld_url and ld_url not in existing_urls:
+            existing_urls.add(ld_url)
+            extra_ld_records.append(ld)
+
+    if extra_ld_records:
+        extra_norm, extra_val = validate_and_normalize_records(
+            extra_ld_records, base_url=base_url, config=config, filter_non_products=True
+        )
+        records.extend(extra_norm)
+        card_metrics["rejected_non_products"] = list(card_metrics.get("rejected_non_products", [])) + list(
+            extra_val.get("rejected_non_products", [])
+        )
+        _, card_metrics["validation"] = validate_and_normalize_records(
+            records, base_url=base_url, config=config, filter_non_products=True
+        )
+
+    diagnostics = {
+        "page_metadata": semantic["page_metadata"],
+        "json_ld_count": len(semantic["json_ld"]["products"]),
+        "product_cards_detected": len(cards),
+        "rejected_non_products": card_metrics.get("rejected_non_products", []),
+        "rejected_non_product_count": len(card_metrics.get("rejected_non_products", [])),
+        "raw_text_preview": semantic["raw_text_preview"][:1500],
+        **card_metrics,
+    }
+    return records, diagnostics
+
+
+def extract_semantic_details_batch(
+    detail_pages: list[tuple[str, str]],
+    base_url: str,
+) -> dict:
+    """
+    Extract and validate structured details for a list of (detail_url, detail_html) pairs
+    using the same semantic extraction and LLM pipeline.
+    """
+    semantic_details = [extract_semantic_detail(html, url) for url, html in detail_pages]
+    llm_res = extract_details_with_llm(semantic_details)
+
+    normalized_by_url: dict[str, dict] = {}
+    for detail in semantic_details:
+        src = detail["source_url"]
+        raw_detail = llm_res["details_by_url"].get(src)
+        if not raw_detail:
+            continue
+        norm_list, _ = validate_and_normalize_records([raw_detail], base_url=src)
+        if norm_list:
+            norm_rec = norm_list[0]
+            norm_rec["detail_metadata"] = {
+                "source_url": src,
+                "h1": detail.get("h1"),
+                "canonical_url": detail["page_metadata"].get("canonical_url"),
+                "json_ld_count": len(detail.get("json_ld_products") or []),
+            }
+            normalized_by_url[canonicalize_product_url(src, base_url)] = norm_rec
+
+    return {
+        "details_by_canonical_url": normalized_by_url,
+        "llm_batches_processed": llm_res["llm_batches_processed"],
+        "llm_cache_hits": llm_res["cache_hits"],
+        "errors": llm_res["errors"],
+    }

@@ -1,6 +1,8 @@
 import re
 from bs4 import BeautifulSoup, Comment
 
+from app.services.semantic_extractor import normalize_inline_text
+
 ALLOWED_ATTRS = {
     "class", "id", "href", "src", "alt", "title",
     "itemprop", "data-testid", "data-component-type",
@@ -35,7 +37,7 @@ def clean_html(html: str, max_chars: int = 18000) -> str:
     for tag in soup.find_all(True):
         tag.attrs = {k: v for k, v in tag.attrs.items() if k in ALLOWED_ATTRS}
         for text_node in tag.find_all(string=True):
-            value = " ".join(str(text_node).split())
+            value = normalize_inline_text(str(text_node))
             if len(value) > 200:
                 text_node.replace_with(value[:200])
             else:
@@ -144,3 +146,4 @@ def extract_representative_html(html: str, target_chars: int = 4000, max_cards: 
     body = soup.find("body") or soup
     clean_element_attrs(body, keep_classes=3)
     return str(body)[:target_chars]
+ 

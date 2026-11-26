@@ -33,7 +33,9 @@ class SiteOut(BaseModel):
 
 class ExtractionRequest(BaseModel):
     config_id: int = Field(gt=0)
-    max_pages: int | None = Field(default=None, ge=1, le=20)
+    max_pages: int | None = Field(default=None, ge=1, le=100)
+    extract_details: bool | None = None
+    max_detail_pages: int | None = Field(default=None, ge=1, le=500)
 
 
 class ExtractionResponse(BaseModel):
